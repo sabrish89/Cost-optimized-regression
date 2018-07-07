@@ -1,0 +1,333 @@
+---
+title: "Logistic Regression : German Credit Worthiness/Goodness model"
+author: "Sabrish"
+date: "3 July 2018"
+output: word_document
+mainfont: Times New Roman
+---
+
+```{r}
+setwd("C:/Users/Sabrish/Documents/Big Data Assignment")
+library(pacman)
+p_load(magrittr,tidyverse,caret,readr,DataExplorer,ggplot2,dplyr,data.table,DMwR,Metrics)
+data<-read_csv("Data for Project v.csv")
+```
+
+## Data loading and inspection
+
+## Helpers
+```{r}
+
+'%ni%'<-Negate('%in%')
+
+get_all_numerics<-function(target){
+  colnames<-colnames(target)
+  list_of_numerics<-vector(mode = "character")
+  for(i in 1:ncol(target)){
+    if(is.numeric(target[[i]]) == TRUE){
+      if(!colnames[i] %in%  c("id","timestamp","OBS#"))
+        list_of_numerics[length(list_of_numerics) + 1]<-colnames[i]
+    }
+  }
+  rm(colnames)
+  return(list_of_numerics)
+}
+
+get_all_characters<-function(target){
+  target = data
+  colnames<-colnames(target)
+  list_of_characters<-vector(mode = "character")
+  for(i in 1:ncol(target)){
+    if(!is.numeric(target[[i]]) == TRUE){
+      if(!colnames[i] %in%  c("id","timestamp","OBS#"))
+        list_of_characters[length(list_of_characters) + 1]<-colnames[i]
+    }
+  }
+  rm(colnames)
+  return(list_of_characters)
+}
+
+get_candidate_factors<-function(target){
+  names=character(0)
+  for(name in colnames(data)){
+    if(length(unique(data[[name]])) <= 6 & name %ni% c("INSTALL_RATE","NUM_CREDITS","NUM_DEPENDENTS")){
+      names=c(names,name)
+    }
+  }
+ return(names)
+}
+
+one_entry <- function(target) {
+    for (i in length(target)) attr(target[[i]], "names") <- NULL
+    return(target)
+}
+
+get_class<-function(target,threshold){
+  output=numeric(0)
+  output[target >= threshold] = 1
+  output[target < threshold] = 0
+  return(output)
+}
+
+get_feature_importance_list<-function(model){
+  imp<-varImp(model)
+  return(rev(rownames(imp)))
+}
+
+```
+
+
+## Checking Missingness in data
+```{r}
+
+if(length(get_all_numerics(data)) == 0){
+  print("No numerically typed variables found")
+} else {
+  plot_missing(data[,get_all_numerics(data)])
+}
+
+if(length(get_all_characters(data)) == 0){
+  print("No character typed variables found")
+} else {
+  plot_missing(data[,get_all_characters(data)])
+}
+```
+Since there are no missing values for any numerically typed variable, we do not need to perform explicit imputations
+Character typed variables not found
+
+
+## Check balance of target in data
+```{r}
+data%>%
+  group_by(RESPONSE)%>%
+  summarise(proportion = n()/nrow(data))%>%
+  mutate(RESPONSE=as.factor(RESPONSE))%>%
+  ggplot(aes(x=RESPONSE,y=proportion)) + geom_bar(stat = "identity") + xlab("Target Levels") + ylab("Proportion of support")
+  
+```
+Since there is an imbalance in data, we may need to undersample 1 and oversample 0, to get consistent representation
+across all levels of data for the model to predict targets without representation bias
+
+
+## Set consistent typing across variables in data, exclude indices
+```{r}
+if("OBS#" %in% colnames(data)){
+  data<-data%>%
+  select(-one_of("OBS#"))
+}
+sapply(data, typeof)
+```
+Since there are numerous indicator variables that are typed as integers, lets start by converting them to factors
+```{r}
+data<-as.data.frame(lapply(data, one_entry))
+for(name in get_candidate_factors(data)){
+  data[[name]] = as.factor(data[[name]])
+}
+str(data)
+```
+
+
+## Split dataset into train-test-validation
+```{r}
+set.seed(777)
+spec = c(train = .5, validate = .3, test = .2)
+g = sample(cut(seq(nrow(data)), nrow(data)*cumsum(c(0,spec)),labels = names(spec)))
+dsets = split(data, g)
+rm(spec,g)
+sprintf("Number of entries in train dataset: %s",nrow(dsets$train))
+sprintf("Number of entries in validate dataset: %s",nrow(dsets$validate))
+sprintf("Number of entries in test dataset: %s",nrow(dsets$test))
+```
+
+
+## SMOTE
+```{r}
+set.seed(777)
+dsets$train<-SMOTE(RESPONSE~.,dsets$train,perc.over = 100,perc.under = 200)
+dsets$train%>%
+  group_by(RESPONSE)%>%
+  summarise(proportion=n()/nrow(dsets$train))%>%
+  ggplot(aes(x=RESPONSE,y=proportion)) + geom_bar(stat = "identity")
+```
+
+
+## Build Logistic Regression Model on training dataset
+```{r}
+full_model<-glm(RESPONSE~.,data = dsets$train,family="binomial")
+summary(full_model)
+cat("\nOdds Coefficients of regression:\n")
+exp(full_model$coefficients)[names(exp(full_model$coefficients)) %like% '1' | names(exp(full_model$coefficients)) %like% '2']
+```
+
+
+## Model Pruning via validation dataset + removing insignificant variables as per Wald test of significance
+```{r}
+full_model<-update(full_model,~.-PRESENT_RESIDENT-MALE_SINGLE-NEW_CAR-MALE_MAR_or_WID)
+validation_predictions<-get_class(predict.glm(full_model,newdata = dsets$validate,type = "response"),0.5)
+table<-table(predictions = validation_predictions,actuals = dsets$validate$RESPONSE)
+print(table)
+cat("\n\n\n")
+misclassification_cost<-table[1,2]*10000+table[2,1]*15000
+sprintf("Total misclassification cost is %s Rs",misclassification_cost)
+cat("\n")
+confusionMatrix(table,positive = "1")
+```
+```{r}
+df<-data.frame(variable=numeric(),cost=numeric(),stringsAsFactors = FALSE)
+dummy_model<-full_model
+```
+Removing the least important variables one - by - one...<b>Please Execute this chunk several times</b>
+```{r}
+feature<-gsub("\\d","",get_feature_importance_list(dummy_model)[1])
+dummy_model <- update(dummy_model, as.formula(paste(".~.-", feature)) )
+predictions<-get_class(predict(dummy_model,dsets$validate,type = "response"),0.5)
+table<-table(predictions = predictions,actuals = dsets$validate$RESPONSE)
+print(table)
+cat("\n\n\n")
+misclassification_cost<-table[1,2]*10000+table[2,1]*15000
+sprintf("Total misclassification cost post removal of %s is %s Rs",feature,misclassification_cost)
+new<-list(variable=feature,cost=misclassification_cost)
+df<-rbind(df,as.data.frame(new))
+df%>%
+  ggplot(aes(x=variable,y=cost,group=1)) + geom_point() + geom_line(aes(x=variable,y=cost)) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+summary(dummy_model)
+```
+As can be seen in the above plot, the minimum is reached on eliminating variables upto EMPLOYMENT.
+Also post removal of EMPLOYMENT, the cost is seen to only rise.
+However from the initial model summary, we see that factors like RENT, OTHER_INSTALL, GUARANTOR, MALE_DIV are all significant variables in model, except for CO.APPLICANT.
+Also, post removal of OWN_RES, the behaviour of the cost function is highly unstable post PROP_UNKN_NONE.
+Thus as a compromise to preserving information and minimizing cost, I chose removal upto OWN_RES. Below are results of this
+reduced model on the test set. Note that this is not the end and further pruning is also done subsequently.
+
+
+## Find misclassification cost on test dataset & pruning
+```{r}
+final_model<-update(full_model,~.-FOREIGN-TELEPHONE-NUM_DEPENDENTS-JOB-NUM_CREDITS-OWN_RES-CO.APPLICANT)
+
+predictions_model<-get_class(predict(final_model,dsets$test,type = "response"),0.5)
+table_model<-table(predictions = predictions_model,actuals = dsets$test$RESPONSE)
+print(table_model)
+cat("\n\n\n")
+false_negative_cost<-table_model[1,2]*10000
+false_positive_cost<-table_model[2,1]*15000
+sprintf("Misclassification cost on test dataset is %s Rs",as.integer(false_positive_cost+false_negative_cost))
+cat("\n")
+sprintf("Total cost due to false positive is %s Rs and due to false negative is %s Rs",as.integer(false_positive_cost),as.integer(false_negative_cost))
+cat("\n\n\n")
+
+predictions<-get_class(predict(full_model,dsets$test,type = "response"),0.5)
+table<-table(predictions = predictions,actuals = dsets$test$RESPONSE)
+print(table)
+cat("\n\n\n")
+misclassification_cost<-table[1,2]*10000+table[2,1]*15000
+sprintf("Misclassification cost of full model on test dataset is %s Rs",as.integer(misclassification_cost))
+```
+However, this is not the leanest model we may achieve. Further pruning
+is possible based on variable insignificance on the final_model. This is done below.
+
+
+## Further pruning
+```{r}
+#Removing superfluous variables
+final_model<-update(final_model,~.-REAL_ESTATE-PROP_UNKN_NONE-EDUCATION-RETRAINING)
+predictions_model<-get_class(predict(final_model,dsets$test,type = "response"),0.5)
+table_model<-table(predictions = predictions_model,actuals = dsets$test$RESPONSE)
+print(table_model)
+cat("\n\n\n")
+false_negative_cost<-table_model[1,2]*10000
+false_positive_cost<-table_model[2,1]*15000
+sprintf("Misclassification cost on test dataset is %s Rs",as.integer(false_positive_cost+false_negative_cost))
+cat("\n")
+sprintf("Total cost due to false positive is %s Rs and due to false negative is %s Rs",as.integer(false_positive_cost),as.integer(false_negative_cost))
+cat("\n\n\n")
+
+predictions<-get_class(predict(full_model,dsets$test,type = "response"),0.5)
+table<-table(predictions = predictions,actuals = dsets$test$RESPONSE)
+print(table)
+cat("\n\n\n")
+misclassification_cost<-table[1,2]*10000+table[2,1]*15000
+sprintf("Misclassification cost of full model on test dataset is %s Rs",as.integer(misclassification_cost))
+```
+As can be seen in confusion matrix above, this leaner model is equally efficacious but now with lesser demand of inputs and easier data feed.
+Our pruned model optimizes and achieves misclassification minimization by reducing the costlier False Positive misclassification and significantly reducing the cheaper False Negative miscalssification rate. This in turn, results in
+improved precison,recall,specificity and accuracy.
+
+Below is the summary.
+## Some performance statistics
+```{r}
+confusionMatrix(table_model,positive = "1")
+
+df<-data.frame(tpr=numeric(),fpr=numeric())
+for(th in seq(0,1,0.01)){
+  predictions<-get_class(predict(final_model,dsets$test,type = "response"),th)
+  new=list(tpr=sum(predictions == 1 & dsets$test$RESPONSE == 1)/nrow(dsets$test),
+           fpr=sum(predictions == 1 & dsets$test$RESPONSE == 0)/nrow(dsets$test))
+  df<-rbind(df,as.data.frame(new))
+}
+
+df%>%
+  ggplot(aes(x=fpr,y=tpr)) + geom_point() + geom_smooth(method = "loess") + 
+  geom_text(aes(x=0.01,y=0.8,label=paste("AUC : ",round(auc(dsets$test$RESPONSE,predictions_model),digits = 2)))) + 
+  xlab("1 - Specificity %") + ylab("Sensitivity %") + ggtitle("ROC curve") + 
+  geom_abline(slope = 1,intercept = 0,linetype=2)
+```
+## Final model
+```{r}
+formula(final_model)
+```
+
+## Additional exercise - set up
+```{r}
+proportion_false_positives=100/(0.4*5000)
+proportion_false_negatives=200/(0.4*5000)
+
+expense_model<-function(x){
+  return(5000000 + ( 1000000 + proportion_false_positives*25000*1000 + proportion_false_negatives*10000*1000) * x)
+}
+expense_manual<-function(x){
+  return(5000*1000*x)
+}
+
+to_root<-function(x){
+  expense_manual(x) - expense_model(x)
+}
+
+df<-data.frame(month=integer(),model=numeric(),manual=numeric(),pnl=numeric())
+```
+
+## simulation
+```{r}
+for(x in 1:12){
+  new<-list(month=x,model=expense_model(x),manual=expense_manual(x),pnl=to_root(x))
+  df<-rbind(df,as.data.frame(new))
+}
+
+df%>%
+  ggplot() + geom_point(aes(x=month,y=model)) + geom_line(aes(x=month,y=model,group=1),color="blue") + 
+  geom_point(aes(x=month,y=manual)) + geom_line(aes(x=month,y=manual,group=2),color="orange") + 
+  xlab("months") + ylab("cumulative cost") + 
+  geom_vline(xintercept = round(uniroot(to_root,c(1,12))$root),linetype="dashed") + 
+  scale_x_continuous(breaks = c(1,2,round(uniroot(to_root,c(1,12))$root),4,5,6,7,8,9,10,11,12)) +
+  geom_text(aes(x=5,y=40000000,label="manual process cost curve"),color="orange") + 
+  geom_text(aes(x=7,y=20000000,label="NN process cost curve"),color="blue") + 
+  geom_text(aes(x=3,y=60000000),label="payback point")
+
+df%>%
+  ggplot(aes(x=month,y=as.integer(pnl),group=1)) + geom_point() + geom_smooth(method = "loess") + 
+  geom_abline(intercept = 0) + xlab("months ->") + ylab("Profit or Loss \ncompared to manual process ->") + 
+  geom_vline(xintercept = uniroot(to_root,c(1,12))$root,linetype="dashed") + 
+  scale_x_continuous(breaks = round(uniroot(to_root,c(1,12))$root)) + geom_text(aes(x=3,y=15000000),label="payback point")
+
+payback_period=round(uniroot(to_root,c(1,12))$root)
+```
+
+
+```{r}
+monthly_savings_due_to_model<-expense_manual(1) - ( expense_model(1) - 5000000 )
+ROI<-monthly_savings_due_to_model/5000000 * 100
+sprintf("Monthly savings due to NN model: %s Rs",monthly_savings_due_to_model)
+cat("\n")
+sprintf("ROI due to NN model: %s percent",ROI)
+cat("\n")
+sprintf("Payback period to payback initial investment and convert surplus operating revenue to profit: %s months",payback_period)
+```
